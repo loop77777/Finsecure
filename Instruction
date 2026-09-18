@@ -1,0 +1,148 @@
+Enterprise Specification & Technical Problem Statement1. Business Context & Operational DomainFinSecure Global operates as a Tier-1 financial transaction processing network handling high-frequency interbank settlements, foreign currency exchanges, corporate securities disbursements, and automated fraud-compliance monitoring. The network interfaces with real-time gross settlement (RTGS) streams, the Society for Worldwide Interbank Financial Telecommunication (SWIFT), and Automated Clearing House (ACH) rails.The network operations center requires a resilient, deterministic, memory-efficient core processing hub: the FinSecure Engine. The engine must ingest structured and unstructured telemetry streams, validate transaction integrity against strict protocol specifications, compute dynamic risk scores, evaluate foreign exchange tariffs, buffer incoming transactions in a fixed-capacity staging pipeline, audit records concurrently, format regional currencies, and settle funds into customer balances without memory leaks or race conditions.To meet financial regulatory standards, the engine must be implemented in Java, conforming strictly to language specifications across memory architecture, type safety, flow control, object-oriented design, error recovery, pattern matching, and multi-threaded string manipulation.2. Functional & Business Domain Requirements                       INCOMING TELEMETRY STREAM
+                                   │
+                                   ▼
+          ┌─────────────────────────────────────────────────┐
+          │  Stage 1: Ingestion & Regex Pattern Validation  │
+          │  - Match: TXN-<code>;VAL=<amt>;CUR=<iso>        │
+          │  - Reject malformed payloads immediately        │
+          └────────────────────────┬────────────────────────┘
+                                   │
+                                   ▼
+          ┌─────────────────────────────────────────────────┐
+          │  Stage 2: Staging Buffer & Concurrency Gate     │
+          │  - Staging Bay capacity: exactly 3 slots        │
+          │  - Capacity check (fail-fast: Buffer Overflow)  │
+          └────────────────────────┬────────────────────────┘
+                                   │
+                                   ▼
+          ┌─────────────────────────────────────────────────┐
+          │  Stage 3: Tariff Calculation & Risk Scoring     │
+          │  - Categorize by TransactionType                │
+          │  - Apply compliance fees (Ternary / Thresholds) │
+          │  - Flag AML / CFT anomalies                     │
+          └────────────────────────┬────────────────────────┘
+                                   │
+                                   ▼
+          ┌─────────────────────────────────────────────────┐
+          │  Stage 4: Balance Settlement & Audit Trail      │
+          │  - Atomic balance mutations on BankAccount      │
+          │  - Generate fast audit digest (StringBuilder)   │
+          │  - Append thread-safe log (StringBuffer)        │
+          │  - Output localized currency receipts           │
+          └─────────────────────────────────────────────────┘
+2.1 Ingestion & Payload ValidationProtocol Ingestion: The engine must read raw telemetry streams over socket connections formatted as:$$\text{TXN-}\langle\text{AlphanumericCode}\rangle\text{;VAL=}\langle\text{DecimalAmount}\rangle\text{;CUR=}\langle\text{3-Letter ISO Currency}\rangle$$Pattern Matching: Payload segments must be parsed using precompiled regular expressions with named-capturing groups (txCode, val, cur).Validation Guards: If an incoming message fails regex structure, contains an invalid currency denomination, or specifies a negative/zero amount, the system must abort processing and raise a checked InvalidPayloadException.2.2 Staging Queue & Capacity InvariantsConveyor Buffer: Due to hardware memory limits on line-rate settlement cards, incoming transactions must be held in a fixed-capacity staging array with a strict limit of $N = 3$ slots.Overflow Handling: When a transaction arrives and all staging slots are occupied, the engine must reject the packet immediately by throwing an unchecked LedgerCapacityExceededException without blocking the main event loop.Buffer De-staging: As transactions are cleared, the corresponding array slots must be reset to null to permit timely garbage reclamation of completed payload references.2.3 Tariff Computation, Risk Scoring, & Anti-Money Laundering (AML)Transaction Classification: Transactions are grouped into three distinct categories, each with its own tariff schedule:DOMESTIC_TRANSFER: Base fee of $5.00, standard tariff multiplier of $1.0\times$.CROSS_BORDER: Base fee of $25.00, risk multiplier of $2.5\times$.SECURITIES_SETTLEMENT: Base fee of $100.00, risk multiplier of $4.0\times$.Compliance Thresholds: Transactions with an aggregate settlement sum exceeding $100,000.00 must incur an additional $50.00 high-volume audit fee; otherwise, a baseline $10.00 documentation fee is assessed.AML Anomaly Tripping: Any transaction that is both classified as CROSS_BORDER and carries a gross value exceeding $250,000.00 must trigger an automated AML anomaly flag (isSuspicious = true) for compliance auditing.2.4 Multilateral Settlement & Payment InstrumentsAccount Ledger Updates: Validated transactions must deposit settled funds directly into the recipient's BankAccount. Credit-based card transactions must run through an abstract payment hierarchy to verify credit limit headroom before approval.Dual-Track Audit Logging:Single-threaded transaction digests must be constructed via StringBuilder for maximum string-concatenation performance.Multi-threaded, shared operational ledgers must be logged via StringBuffer to guarantee thread safety.Localization: Final settlement receipts must produce currency formats localized for the United States (Locale.US), Germany (Locale.GERMANY), and India (new Locale("en", "IN")).
+
++-------------------------------------------------------------------------+
+ |                            <<interface>>                                |
+ |                           AuditableEntity                               |
+ +-------------------------------------------------------------------------+
+ | + AUDIT_SYSTEM_VERSION : String = "v26.3-LTS"   <<public static final>> |
+ | + BASE_PROCESSING_FEE  : double = 1.50          <<public static final>> |
+ +-------------------------------------------------------------------------+
+ | + generateAuditDigest() : String                <<public abstract>>     |
+ | + getEntityId() : String                        <<public abstract>>     |
+ +-------------------------------------------------------------------------+
+                                      ^
+                                      | implements
+                 +--------------------+--------------------+
+                 |                                         |
+ +-------------------------------+         +-------------------------------+
+ |      <<abstract class>>       |         |          BankAccount          |
+ |       PaymentInstrument       |         +-------------------------------+
+ +-------------------------------+         | - accountNumber : String      |
+ | - instrumentId : String       |         | - accountHolder : String      |
+ | - holderName   : String       |         | - balance       : double      |
+ | - active       : boolean      |         +-------------------------------+
+ +-------------------------------+         | + BankAccount(accNum, hldr, b)|
+ | + PaymentInstrument(id, name) |         | + deposit(amount : double)    |
+ | + getInstrumentId() : String  |         | + withdraw(amount : double)   |
+ | + getHolderName() : String    |         | + getBalance() : double       |
+ | + isActive() : boolean        |         | + getAccountHolder() : String |
+ | + setActive(active : boolean) |         | + generateAuditDigest():String|
+ | + processDebit(amt) : boolean |*abstract| + getEntityId() : String      |
+ +-------------------------------+         +-------------------------------+
+                 ^                                         ^
+                 | extends (Is-A)                          | aggregates / Has-A
+ +-------------------------------+                         |
+ |          CreditCard           |                         |
+ +-------------------------------+                         |
+ | - cardNumber    : String      |                         |
+ | - creditLimit   : double      |                         |
+ | - currentBalance: double      |                         |
+ +-------------------------------+                         |
+ | + CreditCard(id, hldr, num, l)|                         |
+ | + processDebit(amt) : boolean |                         |
+ | + executeContactlessNfcSwipe()|                         |
+ | + getCurrentBalance() : double|                         |
+ +-------------------------------+                         |
+                                                           |
+ +---------------------------------------------------------+---------------+
+ |                               TransactionRecord                         |
+ +-------------------------------------------------------------------------+
+ | - rawPayloadFlag   : byte = 0x7E                                        |
+ | - routingPrefix    : short = 0b0101_1010                                |
+ | - transactionIndex : int                                                |
+ | - epochTimestampNs : long = 1_726_000_000_000_000L                      |
+ | - riskThreshold    : float = 0.05f                                      |
+ | - transactionAmount: double                                             |
+ | - currencySymbol   : char = '$'                                         |
+ | - isSuspicious     : boolean                                            |
+ | - transactionId    : String                                             |
+ | - type             : TransactionType                                    |
+ | - targetAccount    : BankAccount                                        |
+ +-------------------------------------------------------------------------+
+ | <<static>> static { }                                                   |
+ | <<instance>> { }                                                        |
+ | + TransactionRecord()                                                   |
+ | + TransactionRecord(txId : String, amt : double, type : TransactionType)|
+ | + TransactionRecord(txId, amt, type, targetAccount : BankAccount)       |
+ | + [JavaBeans Getters and Setters for all attributes]                    |
+ | + generateAuditDigest() : String                                        |
+ | + getEntityId() : String                                                |
+ +-------------------------------------------------------------------------+
+               ^                                            ^
+               | 0..3 (Staged in array)                     | operates on
+               |                                            |
+ +-----------------------------+              +-----------------------------+
+ |  SettlementBatchProcessor   |              |     <<enumeration>>         |
+ +-----------------------------+              |     TransactionType         |
+ | - batchSlots: Transaction[] |              +-----------------------------+
+ | - queueHead : int = 0       |              | DOMESTIC_TRANSFER(1.0)      |
+ | - totalVolume : static dbl  |              | CROSS_BORDER(2.5)           |
+ | - processedCount: static int|              | SECURITIES_SETTLEMENT(4.0)  |
+ +-----------------------------+              +-----------------------------+
+ | + stageTransaction(tx)      |              | - tariffMultiplier : double |
+ | + processBatchQueue()       |              | - description      : String |
+ | + demonstratePassByValue()  |              +-----------------------------+
+ | + compileAuditTrail()       |              | + getTariffMultiplier()     |
+ | + appendThreadSafeLog()     |              | + getDescription()          |
+ | + parseAndVerifyTelemetry() |              +-----------------------------+
+ | + printSystemTotals() : void|
+ +-----------------------------+
+               │
+               │ throws
+               ▼
+ +-----------------------------+              +-----------------------------+
+ |   <<checked exception>>     |              |    <<unchecked exception>>  |
+ |   InvalidPayloadException   |              | LedgerCapacityExceededExc   |
+ +-----------------------------+              +-----------------------------+
+ | + InvalidPayloadException(m)|              | + LedgerCapacityExceeded(m) |
+ +-----------------------------+              +-----------------------------+
+
+ src/
+ └── com/
+     └── finsecure/
+         ├── exception/
+         │   ├── InvalidPayloadException.java
+         │   └── LedgerCapacityExceededException.java
+         ├── model/
+         │   ├── AuditableEntity.java
+         │   ├── BankAccount.java
+         │   ├── PaymentInstrument.java
+         │   ├── CreditCard.java
+         │   ├── TransactionType.java
+         │   └── TransactionRecord.java
+         ├── service/
+         │   └── SettlementBatchProcessor.java
+         └── app/
+             └── FinSecureEngine.java
